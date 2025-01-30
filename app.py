@@ -278,10 +278,33 @@ class TradingStrategyEngine:
             'margin_utilization': 'Max 60% during high volatility'
         }
 
+# Add root route
+@app.route('/')
+def home():
+    return """
+    <h1>Stocxer AI F&O Analysis API</h1>
+    <p>Send POST requests to /analyze with your market data payload</p>
+    <p>Example curl command:</p>
+    <pre>
+    curl -X POST -H "Content-Type: application/json" \\
+         -d '{"your": "payload"}' \\
+         https://<url>/analyze
+    </pre>
+    """
+
+# Add health check route
+@app.route('/health')
+def health_check():
+    return jsonify({"status": "healthy", "version": "1.0.0"})
+
+# Your existing analysis routes
 @app.route('/analyze', methods=['POST'])
 def analyze():
     try:
         payload = request.get_json()
+        if not payload:
+            return jsonify({"error": "No payload provided"}), 400
+            
         analyzer = IndexOptionsAnalyzer()
         analysis = analyzer.analyze_options(payload)
         strategy_engine = TradingStrategyEngine()
