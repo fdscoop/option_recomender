@@ -1,0 +1,6 @@
+Flask
+pandas
+numpy
+scipy
+requests
+gunicorn
