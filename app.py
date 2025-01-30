@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
-from datetime import datetime, timedelta
+from datetime import datetime
 import logging
 from typing import Dict, List, Any
 
@@ -65,136 +65,173 @@ class OptionsGreeksCalculator:
         }
 
 class IndexOptionsAnalyzer:
-    """Analyze Nifty options chain with zero volume handling"""
     def __init__(self):
         self.greeks_calculator = OptionsGreeksCalculator()
-        self.nifty_lot_size = 75  # Standard Nifty lot size
 
     def analyze_options(self, payload: Dict) -> Dict:
         try:
-            current_price = payload['current_market']['index']['ltp']
-            vix = payload['current_market']['vix']['ltp']
-            futures_data = payload['current_market']['futures']
+            # Access nested analysis data
+            analysis_data = payload.get('analysis', {})
             
-            # Process options chain
+            # Validate payload structure
+            required_keys = ['current_market', 'options', 'historical_data']
+            if not all(key in analysis_data for key in required_keys):
+                return {'error': 'Invalid payload structure - missing required top-level keys'}
+
+            current_market = analysis_data['current_market']
+            options_data = analysis_data['options']
+            historical_data = analysis_data['historical_data']
+
+            # Safely extract values with defaults
+            current_price = current_market.get('index', {}).get('ltp', 0)
+            vix = current_market.get('vix', {}).get('ltp', 0)
+            futures_data = current_market.get('futures', {})
+
+            # Process options with validation
             options_chain = {
-                'calls': self._process_options(payload['options']['calls'], 'CE', current_price, vix, futures_data),
-                'puts': self._process_options(payload['options']['puts'], 'PE', current_price, vix, futures_data)
+                'calls': self._process_options(
+                    options_data.get('calls', []), 
+                    current_price,
+                    vix,
+                    futures_data
+                ),
+                'puts': self._process_options(
+                    options_data.get('puts', []),
+                    current_price,
+                    vix,
+                    futures_data
+                )
             }
 
             return {
                 'current_price': current_price,
                 'vix': vix,
                 'options_chain': options_chain,
-                'strategy_ratings': self._calculate_strategy_ratings(options_chain, vix),
-                'market_conditions': self._analyze_market_conditions(payload)
+                'market_conditions': self._analyze_market_conditions(historical_data),
+                'strategy_ratings': self._calculate_strategy_ratings(options_chain, vix)
             }
+
+        except KeyError as e:
+            logger.error(f"Missing key in payload: {e}")
+            return {'error': f'Missing required field: {e}'}
         except Exception as e:
             logger.error(f"Analysis error: {e}")
-            return {}
+            return {'error': str(e)}
 
-    def _process_options(self, options: List[Dict], opt_type: str,
-                       spot: float, vix: float, futures: Dict) -> List[Dict]:
-        analyzed = []
+    def _process_options(self, options: List[Dict], spot: float, 
+                       vix: float, futures: Dict) -> List[Dict]:
+        processed = []
         for opt in options:
             try:
                 greeks = self.greeks_calculator.calculate_greeks(
-                    spot, opt['strikePrice'], opt['expiry'], vix/100, opt_type
+                    spot=spot,
+                    strike=opt.get('strike', 0),
+                    expiry=opt.get('expiry', ''),
+                    iv=vix/100,
+                    opt_type=opt.get('optionType', 'CE')
                 )
-                analyzed.append({
-                    'strike': opt['strikePrice'],
-                    'premium': opt['ltp'],
-                    'expiry': opt['expiry'],
-                    'oi': opt['openInterest'],
+
+                processed.append({
+                    'strike': opt.get('strike', 0),
+                    'premium': opt.get('ltp', 0),
+                    'expiry': opt.get('expiry', ''),
+                    'type': opt.get('optionType', 'CE').upper(),
                     'greeks': greeks,
-                    'liquidity_score': self._calculate_liquidity(opt, futures),
-                    'trading_zones': self._calculate_trading_zones(opt, greeks, vix),
-                    'timeframe_suitability': self._timeframe_suitability(greeks, vix)
+                    'liquidity_score': self._calculate_liquidity(
+                        opt.get('openInterest', 0),
+                        futures.get('openInterest', 0)
+                    ),
+                    'depth': self._process_depth(opt.get('depth', {})),
+                    'timeframe_suitability': {
+                        'scalping': greeks.get('gamma', 0) * 2,
+                        'intraday': greeks.get('delta', 0) ** 2,
+                        'swing': greeks.get('vega', 0) * 0.7
+                    }
                 })
             except Exception as e:
-                logger.warning(f"Skipping option {opt.get('symbolToken')}: {e}")
-        return sorted(analyzed, key=lambda x: abs(x['strike'] - spot))[:3]  # Nearest 3 strikes
+                logger.warning(f"Skipping option {opt.get('symbol', '')}: {e}")
+        return sorted(processed, key=lambda x: abs(x['strike'] - spot))[:3]
 
-    def _calculate_liquidity(self, option: Dict, futures: Dict) -> float:
-        """Calculate liquidity score based on OI and futures liquidity"""
-        futures_oi = futures.get('openInterest', 0)
-        option_oi = option.get('openInterest', 0)
-        if futures_oi > 0:
-            return min(option_oi / (futures_oi / 1000), 1.0)
-        return 0.5  # Default score when futures data missing
+    def _calculate_liquidity(self, option_oi: int, futures_oi: int) -> float:
+        """Calculate liquidity score based on open interest"""
+        if futures_oi == 0:
+            return 0.5  # Default score if futures data is missing
+        return min(option_oi / (futures_oi / 1000), 1.0)
 
-    def _calculate_trading_zones(self, option: Dict, greeks: Dict, vix: float) -> Dict:
-        """Calculate entry/exit points based on volatility and Greeks"""
-        iv_factor = vix / 15  # Normalize around 15 VIX
-        premium = option['ltp']
+    def _process_depth(self, depth: Dict) -> Dict:
         return {
-            'scalping': {
-                'entry': premium * (1 - 0.002*iv_factor),
-                'target': premium * (1 + 0.003*iv_factor),
-                'stoploss': premium * (1 - 0.005*iv_factor)
-            },
-            'intraday': {
-                'entry': premium * (1 - 0.005*iv_factor),
-                'target': premium * (1 + 0.007*iv_factor),
-                'stoploss': premium * (1 - 0.01*iv_factor)
-            },
-            'swing': {
-                'entry': premium * (1 - 0.01*iv_factor),
-                'target': premium * (1 + 0.015*iv_factor),
-                'stoploss': premium * (1 - 0.03*iv_factor)
+            'best_bid': depth.get('buy', [{}])[0].get('price', 0),
+            'best_ask': depth.get('sell', [{}])[0].get('price', 0),
+            'spread': abs(
+                depth.get('sell', [{}])[0].get('price', 0) - 
+                depth.get('buy', [{}])[0].get('price', 0)
+            )
+        }
+
+    def _analyze_market_conditions(self, historical_data: Dict) -> Dict:
+        """Analyze historical data for market trends"""
+        try:
+            index_data = historical_data.get('index', [])
+            if not index_data:
+                return {'trend': 'neutral', 'volatility': 'low'}
+
+            # Convert to DataFrame for easier analysis
+            df = pd.DataFrame(index_data)
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            df.set_index('timestamp', inplace=True)
+
+            # Calculate moving averages
+            df['MA5'] = df['price_data'].apply(lambda x: x['close']).rolling(5).mean()
+            df['MA20'] = df['price_data'].apply(lambda x: x['close']).rolling(20).mean()
+
+            # Determine trend
+            last_row = df.iloc[-1]
+            trend = 'bullish' if last_row['MA5'] > last_row['MA20'] else 'bearish'
+
+            # Calculate volatility
+            daily_returns = df['price_data'].apply(lambda x: x['close']).pct_change().dropna()
+            volatility = 'high' if daily_returns.std() > 0.02 else 'low'
+
+            return {
+                'trend': trend,
+                'volatility': volatility,
+                'last_close': last_row['price_data']['close']
             }
-        }
+        except Exception as e:
+            logger.error(f"Market conditions analysis error: {e}")
+            return {'trend': 'neutral', 'volatility': 'low'}
 
-    def _timeframe_suitability(self, greeks: Dict, vix: float) -> Dict:
-        """Score option suitability for different trading timeframes"""
-        return {
-            'scalping': greeks['gamma'] * 2 - abs(greeks['theta']) * 0.5,
-            'intraday': greeks['delta']**2 + greeks['vega'] * (vix/20),
-            'swing': greeks['vega'] * 0.7 - greeks['theta'] * 0.3
-        }
+    def _calculate_strategy_ratings(self, options_chain: Dict, vix: float) -> Dict:
+        """Calculate strategy ratings based on options chain and VIX"""
+        try:
+            scores = {
+                'scalping': 0,
+                'intraday': 0,
+                'swing': 0
+            }
 
-    def _calculate_strategy_ratings(self, options: Dict, vix: float) -> Dict:
-        """Generate strategy recommendations based on market conditions"""
-        return {
-            'scalping': self._score_strategy(options, 'scalping', vix),
-            'intraday': self._score_strategy(options, 'intraday', vix),
-            'swing': self._score_strategy(options, 'swing', vix)
-        }
+            for opt_type in ['calls', 'puts']:
+                for opt in options_chain[opt_type]:
+                    scores['scalping'] += opt['greeks'].get('gamma', 0) * 2
+                    scores['intraday'] += opt['greeks'].get('delta', 0) ** 2
+                    scores['swing'] += opt['greeks'].get('vega', 0) * 0.7
 
-    def _score_strategy(self, options: Dict, timeframe: str, vix: float) -> Dict:
-        scores = []
-        for opt_type in ['calls', 'puts']:
-            scores.extend([opt['timeframe_suitability'][timeframe] for opt in options[opt_type]])
-        return {
-            'confidence': min(max(np.mean(scores)*2, 0), 1),
-            'recommended_lots': int((2 if vix < 18 else 1) * (1 if timeframe == 'scalping' else 0.5))
-        }
+            # Normalize scores
+            total = sum(scores.values())
+            if total > 0:
+                for key in scores:
+                    scores[key] /= total
 
-    def _analyze_market_conditions(self, payload: Dict) -> Dict:
-        """Determine overall market trend and sentiment"""
-        hist_data = pd.DataFrame(payload['historical_data']['index'])
-        hist_data['date'] = pd.to_datetime(hist_data['timestamp'])
-        hist_data.set_index('date', inplace=True)
-        
-        return {
-            'trend': self._detect_trend(hist_data),
-            'volatility_regime': 'High' if payload['current_market']['vix']['ltp'] > 18 else 'Normal',
-            'option_skew': self._calculate_skew(payload['options'])
-        }
+            # Adjust for VIX
+            vix_factor = vix / 20
+            scores['scalping'] *= (1 - vix_factor)
+            scores['intraday'] *= vix_factor
+            scores['swing'] *= (1 + vix_factor)
 
-    def _detect_trend(self, data: pd.DataFrame) -> str:
-        """Simple moving average trend detection"""
-        if len(data) < 5: return 'Neutral'
-        data['MA5'] = data['close'].rolling(5).mean()
-        data['MA20'] = data['close'].rolling(20).mean()
-        last = data.iloc[-1]
-        return 'Bullish' if last['MA5'] > last['MA20'] else 'Bearish'
-
-    def _calculate_skew(self, options: Dict) -> float:
-        """Calculate put/call skew"""
-        call_oi = sum(c['openInterest'] for c in options['calls'])
-        put_oi = sum(p['openInterest'] for p in options['puts'])
-        return put_oi / call_oi if call_oi > 0 else 0
+            return scores
+        except Exception as e:
+            logger.error(f"Strategy ratings calculation error: {e}")
+            return {'scalping': 0, 'intraday': 0, 'swing': 0}
 
 class TradingStrategyEngine:
     """Generate executable trading strategies"""
@@ -287,7 +324,7 @@ def home():
     <p>Example curl command:</p>
     <pre>
     curl -X POST -H "Content-Type: application/json" \\
-         -d '{"your": "payload"}' \\
+         -d '{"analysis": {...}}' \\
          https://<url>/analyze
     </pre>
     """
@@ -297,7 +334,7 @@ def home():
 def health_check():
     return jsonify({"status": "healthy", "version": "1.0.0"})
 
-# Your existing analysis routes
+# Analysis endpoint
 @app.route('/analyze', methods=['POST'])
 def analyze():
     try:
