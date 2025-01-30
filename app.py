@@ -7,6 +7,7 @@ import logging
 import re
 from typing import Dict, List, Any
 
+# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -73,25 +74,33 @@ class OptionsGreeksCalculator:
 class IndexOptionsAnalyzer:
     def __init__(self):
         self.greeks_calculator = OptionsGreeksCalculator()
-        self.symbol_pattern = re.compile(r'NIFTY(\d{2}[A-Z]{3}\d{2})(\d{5})(CE|PE)$')
+        self.symbol_pattern = re.compile(r'NIFTY(\d{2}[A-Z]{3}\d{2,4})(\d{5})(CE|PE)$')
 
     def analyze_options(self, payload: Dict) -> Dict:
         try:
             analysis_data = payload.get('analysis', {})
             
             # Validate payload structure
-            if not analysis_data.get('current_market') or not analysis_data.get('options'):
-                return {'error': 'Invalid payload structure'}
+            required_keys = ['current_market', 'historical_data']
+            if not all(k in analysis_data for k in required_keys):
+                return {'error': f"Missing required keys: {required_keys}"}
 
             current_market = analysis_data['current_market']
             historical_data = analysis_data.get('historical_data', {})
-            options_data = current_market.get('options', {})
+            
+            # Validate market data structure
+            market_required = ['index', 'options']
+            if not all(k in current_market for k in market_required):
+                return {'error': f"Missing market data: {market_required}"}
 
-            # Extract market data
+            # Extract market data with safe defaults
             index_data = current_market.get('index', {})
             current_price = index_data.get('ltp', 0)
             vix = current_market.get('vix', {}).get('ltp', 0)
             futures_data = current_market.get('futures', {})
+            options_data = current_market.get('options', {})
+
+            logger.info(f"Processing options with current price: {current_price}, VIX: {vix}")
 
             # Process options chain
             options_chain = {
@@ -117,7 +126,7 @@ class IndexOptionsAnalyzer:
                 'strategy_ratings': self._calculate_strategy_ratings(options_chain, vix)
             }
         except Exception as e:
-            logger.error(f"Analysis error: {e}")
+            logger.error(f"Analysis error: {str(e)}", exc_info=True)
             return {'error': str(e)}
 
     def _process_options(self, options: List[Dict], spot: float, 
@@ -129,14 +138,19 @@ class IndexOptionsAnalyzer:
                 symbol = opt.get('tradingSymbol', '')
                 match = self.symbol_pattern.match(symbol)
                 if not match:
+                    logger.warning(f"Skipping option with invalid symbol: {symbol}")
                     continue
                 
                 expiry_str = match.group(1)
                 strike = float(match.group(2))
-                opt_type = opt.get('optionType', 'CE').upper()
+                opt_type = match.group(3).upper()
 
-                # Convert expiry to required format
-                expiry_date = datetime.strptime(expiry_str, '%d%b%y')
+                # Convert expiry to standard format
+                try:
+                    expiry_date = datetime.strptime(expiry_str, '%d%b%y')
+                except ValueError:
+                    expiry_date = datetime.strptime(expiry_str, '%d%b%Y')
+                    
                 formatted_expiry = expiry_date.strftime('%d%b%Y').upper()
 
                 greeks = self.greeks_calculator.calculate_greeks(
@@ -152,9 +166,9 @@ class IndexOptionsAnalyzer:
                     'premium': opt.get('ltp', 0),
                     'expiry': formatted_expiry,
                     'type': opt_type,
-                    'greeks': greeks,
+                    'greeks': greeks or {},
                     'liquidity_score': self._calculate_liquidity(
-                        opt.get('opnInterest', 0),
+                        opt.get('opnInterest', 0),  # Match payload spelling
                         futures.get('opnInterest', 0)
                     ),
                     'depth': self._process_depth(opt.get('depth', {})),
@@ -167,6 +181,7 @@ class IndexOptionsAnalyzer:
             except Exception as e:
                 logger.warning(f"Skipping option {symbol}: {str(e)}")
         
+        # Return top 3 nearest strikes
         return sorted(
             [p for p in processed if p['greeks']], 
             key=lambda x: abs(x['strike'] - spot)
@@ -174,7 +189,7 @@ class IndexOptionsAnalyzer:
 
     def _calculate_liquidity(self, option_oi: int, futures_oi: int) -> float:
         try:
-            if futures_oi <= 0:
+            if futures_oi <= 0 or option_oi <= 0:
                 return 0.5
             return min(option_oi / (futures_oi / 1000), 1.0)
         except:
@@ -219,7 +234,7 @@ class IndexOptionsAnalyzer:
                 'last_close': closes[-1]
             }
         except Exception as e:
-            logger.error(f"Market analysis error: {e}")
+            logger.error(f"Market analysis error: {str(e)}")
             return {'trend': 'neutral', 'volatility': 'low'}
 
     def _calculate_strategy_ratings(self, options_chain: Dict, vix: float) -> Dict:
@@ -231,15 +246,16 @@ class IndexOptionsAnalyzer:
                     scores['intraday'] += opt.get('greeks', {}).get('delta', 0) ** 2
                     scores['swing'] += opt.get('greeks', {}).get('vega', 0) * 0.7
 
-            total = sum(scores.values())
-            vix_factor = max(min(vix / 20, 2.0), 0.5)
+            total = sum(scores.values()) or 1.0  # Prevent division by zero
+            vix_factor = max(min(vix / 20, 2.0), 0.5)  # Clamped between 0.5-2.0
             
             return {
                 'scalping': round(scores['scalping']/total * (1 - vix_factor), 2),
                 'intraday': round(scores['intraday']/total * vix_factor, 2),
                 'swing': round(scores['swing']/total * (1 + vix_factor), 2)
             }
-        except:
+        except Exception as e:
+            logger.error(f"Strategy ratings error: {str(e)}")
             return {'scalping': 0.34, 'intraday': 0.33, 'swing': 0.33}
 
 class TradingStrategyEngine:
@@ -253,7 +269,7 @@ class TradingStrategyEngine:
                 'market_conditions': analysis.get('market_conditions', {})
             }
         except Exception as e:
-            logger.error(f"Strategy generation error: {e}")
+            logger.error(f"Strategy generation error: {str(e)}")
             return {'error': 'Strategy generation failed'}
 
     def _base_strategy(self, analysis: Dict, timeframe: str, holding: str) -> Dict:
@@ -276,7 +292,7 @@ class TradingStrategyEngine:
             options = analysis.get('options_chain', {}).get(opt_type, [])
             if options:
                 sorted_options = sorted(options, 
-                    key=lambda x: x['timeframe_suitability'][timeframe], 
+                    key=lambda x: x.get('timeframe_suitability', {}).get(timeframe, 0), 
                     reverse=True
                 )[:1]
                 selected.extend(sorted_options)
@@ -299,20 +315,31 @@ class TradingStrategyEngine:
 def analyze():
     try:
         payload = request.get_json()
-        if not payload or 'analysis' not in payload:
-            return jsonify({"error": "Invalid payload format"}), 400
-
-        analyzer = IndexOptionsAnalyzer()
-        analysis = analyzer.analyze_options(payload)
         
-        if 'error' in analysis:
-            return jsonify(analysis), 400
+        # Validate payload structure
+        if not payload or not isinstance(payload, dict):
+            return jsonify({"error": "Invalid JSON format"}), 400
+            
+        if 'analysis' not in payload:
+            return jsonify({"error": "Missing 'analysis' key in payload"}), 400
+            
+        analysis_data = payload['analysis']
+        required_keys = ['current_market', 'historical_data']
+        if not all(k in analysis_data for k in required_keys):
+            return jsonify({"error": f"Missing required analysis keys: {required_keys}"}), 400
+
+        # Process analysis
+        analyzer = IndexOptionsAnalyzer()
+        analysis_result = analyzer.analyze_options(payload)
+        
+        if 'error' in analysis_result:
+            return jsonify(analysis_result), 400
 
         strategy_engine = TradingStrategyEngine()
-        return jsonify(strategy_engine.generate_strategies(analysis))
+        return jsonify(strategy_engine.generate_strategies(analysis_result))
         
     except Exception as e:
-        logger.error(f"API error: {e}")
+        logger.error(f"API processing error: {str(e)}", exc_info=True)
         return jsonify({'error': 'Internal server error'}), 500
 
 @app.route('/')
