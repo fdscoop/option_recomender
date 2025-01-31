@@ -1,4 +1,3 @@
-
 from flask import Flask, request, jsonify
 import numpy as np
 from scipy.stats import norm
@@ -54,8 +53,7 @@ class OptionsGreeksCalculator:
         try:
             expiry_date = datetime.strptime(expiry, '%d%b%Y')
             now = datetime.now()
-            t = (expiry_date - now).total_seconds() / (365*24*3600)
-            return max(t, 0)  # Ensure non-negative time
+            return max((expiry_date - now).total_seconds() / (365*24*3600), 0)
         except:
             return 0.0
 
@@ -64,7 +62,7 @@ class OptionsGreeksCalculator:
         return {
             'delta': 1.0 if intrinsic > 0 else 0.0,
             'gamma': 0.0,
-            'theta': 0.0,  # Corrected theta to 0 for expired options
+            'theta': 0.0,
             'vega': 0.0,
             'iv_impact': 0.0
         }
@@ -73,25 +71,21 @@ class IndexOptionsAnalyzer:
     def __init__(self):
         self.greeks_calculator = OptionsGreeksCalculator()
         self.symbol_pattern = re.compile(
-            r'^(NIFTY|BANKNIFTY|FINNIFTY|MIDCPNIFTY)(\d{2}[A-Z]{3}\d{2})(\d{5})(CE|PE)$', 
+            r'^([A-Z]+)(\d{2}[A-Z]{3}\d{2,4})(\d+)(CE|PE)$',
             re.IGNORECASE
         )
 
     def analyze_options(self, payload: Dict) -> Dict:
         try:
             analysis_data = payload.get('analysis', {})
-            
             required_keys = ['current_market', 'historical_data']
+            
             if not all(k in analysis_data for k in required_keys):
                 return {'error': f"Missing required keys: {required_keys}"}
 
             current_market = analysis_data['current_market']
-            historical_data = analysis_data['historical_data']  # Correct extraction
+            historical_data = analysis_data['historical_data']
             
-            market_required = ['index', 'options']
-            if not all(k in current_market for k in market_required):
-                return {'error': f"Missing market data: {market_required}"}
-
             index_data = current_market.get('index', {})
             current_price = index_data.get('ltp', 0)
             vix = current_market.get('vix', {}).get('ltp', 0)
@@ -131,22 +125,29 @@ class IndexOptionsAnalyzer:
         processed = []
         for opt in options:
             try:
-                symbol = opt.get('tradingSymbol', '')
-                match = self.symbol_pattern.match(symbol)
-                if not match:
-                    logger.warning(f"Skipping option with invalid symbol: {symbol}")
-                    continue
-                
-                expiry_str = match.group(2)
-                strike = float(match.group(3))
-                opt_type = match.group(4).upper()
+                # Use explicit fields from payload when available
+                strike = opt.get('strikePrice')
+                expiry_str = opt.get('expiry')
+                opt_type = 'CE' if opt.get('optionType', '') == 'CALL' else 'PE'
 
-                try:
-                    expiry_date = datetime.strptime(expiry_str, '%d%b%y')
-                except ValueError:
-                    expiry_date = datetime.strptime(expiry_str, '%d%b%Y')
+                # Fallback to symbol parsing if needed
+                if not all([strike, expiry_str]):
+                    symbol = opt.get('tradingSymbol', '')
+                    match = self.symbol_pattern.match(symbol)
+                    if not match:
+                        logger.warning(f"Skipping option with invalid symbol: {symbol}")
+                        continue
                     
-                formatted_expiry = expiry_date.strftime('%d%b%Y').upper()
+                    expiry_str = match.group(2)
+                    strike = float(match.group(3))
+
+                # Parse expiry date
+                try:
+                    expiry_date = self._parse_expiry(expiry_str)
+                    formatted_expiry = expiry_date.strftime('%d%b%Y').upper()
+                except ValueError as e:
+                    logger.warning(f"Invalid expiry format {expiry_str}: {str(e)}")
+                    continue
 
                 greeks = self.greeks_calculator.calculate_greeks(
                     spot=spot,
@@ -171,10 +172,29 @@ class IndexOptionsAnalyzer:
                     }
                 })
             except Exception as e:
-                logger.warning(f"Skipping option {symbol}: {str(e)}")
+                logger.warning(f"Skipping option {opt.get('tradingSymbol')}: {str(e)}")
         
-        # Filter for ATM options (±5%) and select top 3 nearest
-        filtered = [p for p in processed if 0.95 < (p['strike'] / spot) < 1.05]
+        return self._filter_atm_options(processed, spot)
+
+    def _parse_expiry(self, expiry_str: str) -> datetime:
+        formats = [
+            '%d%b%Y',  # 06FEB2025
+            '%d%b%y',  # 06FEB25
+            '%d%b',     # 06FEB (assume current year)
+        ]
+        
+        for fmt in formats:
+            try:
+                dt = datetime.strptime(expiry_str, fmt)
+                if fmt == '%d%b':
+                    dt = dt.replace(year=datetime.now().year)
+                return dt
+            except ValueError:
+                continue
+        raise ValueError(f"Unsupported expiry format: {expiry_str}")
+
+    def _filter_atm_options(self, options: List[Dict], spot: float) -> List[Dict]:
+        filtered = [p for p in options if 0.95 < (p['strike'] / spot) < 1.05]
         return sorted(filtered, key=lambda x: abs(x['strike'] - spot))[:3]
 
     def _calculate_liquidity(self, option: Dict, futures: Dict) -> float:
@@ -206,14 +226,15 @@ class IndexOptionsAnalyzer:
             }
         except:
             return {'best_bid': 0, 'best_ask': 0, 'avg_spread': 0}
-    
+
     def _analyze_market_conditions(self, historical_data: Dict, vix: float) -> Dict:
         try:
             index_history = historical_data.get('index', [])
             if not index_history:
                 return {'trend': 'neutral', 'volatility': 'low', 'vix': vix}
 
-            closes = [entry['price_data']['close'] for entry in index_history if 'price_data' in entry and 'close' in entry['price_data']]
+            closes = [entry['price_data']['close'] for entry in index_history 
+                     if 'price_data' in entry and 'close' in entry['price_data']]
                 
             if len(closes) < 20:
                 return {'trend': 'neutral', 'volatility': 'low', 'vix': vix}
@@ -223,7 +244,7 @@ class IndexOptionsAnalyzer:
             daily_returns = np.diff(closes) / closes[:-1]
             
             volatility = 'high' if np.std(daily_returns) > 0.015 else 'low'
-            if vix > 15:  # Override volatility based on VIX
+            if vix > 15:
                 volatility = 'high'
             
             return {
@@ -345,5 +366,3 @@ def home():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
-
-    
