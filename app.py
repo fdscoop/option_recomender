@@ -123,20 +123,19 @@ class IndexOptionsAnalyzer:
             return {'error': str(e)}
 
     def _process_payload_options(self, payload: Dict, spot: float, 
-                           vix: float, futures: Dict, opt_class: str) -> List[Dict]:
+                            vix: float, futures: Dict, opt_class: str) -> List[Dict]:
         processed = []
         try:
-            # Safely navigate through the payload structure
-            options_data = payload.get('analysis', {}).get('current_market', {}).get('options', {})
+            # Correctly navigate to options_structure -> options -> byExpiry
+            options_structure = payload.get('analysis', {}).get('options_structure', {})
+            options_data = options_structure.get('options', {})
             expiry_data = options_data.get('byExpiry', {})
             
-            # Handle case where no expiry data exists
             if not expiry_data:
                 logger.warning("No expiry data found in options payload")
                 return []
 
             for expiry_bucket in expiry_data.values():
-                # Safely get contracts for this option class
                 contracts = expiry_bucket.get(opt_class, {})
                 
                 for strike_data in contracts.values():
@@ -149,7 +148,7 @@ class IndexOptionsAnalyzer:
                             logger.warning(f"Skipping contract: {str(e)}")
             
             return self._filter_atm_options(processed, spot)
-            
+                
         except KeyError as ke:
             logger.error(f"Malformed options data structure: {str(ke)}")
             return []
