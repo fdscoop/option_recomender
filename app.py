@@ -126,26 +126,31 @@ class IndexOptionsAnalyzer:
                             vix: float, futures: Dict, opt_class: str) -> List[Dict]:
         processed = []
         try:
-            # Correctly navigate to options_structure -> options -> byExpiry
             options_structure = payload.get('analysis', {}).get('options_structure', {})
             options_data = options_structure.get('options', {})
             expiry_data = options_data.get('byExpiry', {})
-            
-            if not expiry_data:
-                logger.warning("No expiry data found in options payload")
-                return []
 
             for expiry_bucket in expiry_data.values():
                 contracts = expiry_bucket.get(opt_class, {})
                 
-                for strike_data in contracts.values():
-                    for contract in strike_data.values():
+                # Add type checking for strike data
+                for strike_key, strike_data in contracts.items():
+                    if not isinstance(strike_data, dict):
+                        logger.warning(f"Invalid strike data type for {strike_key}")
+                        continue
+                    
+                    # Add type checking for contract data
+                    for contract_key, contract in strike_data.items():
+                        if not isinstance(contract, dict):
+                            logger.warning(f"Invalid contract type for {contract_key}")
+                            continue
+                            
                         try:
                             processed_option = self._process_contract(contract, spot, vix, futures)
                             if processed_option:
                                 processed.append(processed_option)
                         except Exception as e:
-                            logger.warning(f"Skipping contract: {str(e)}")
+                            logger.warning(f"Skipping contract {contract_key}: {str(e)}")
             
             return self._filter_atm_options(processed, spot)
                 
@@ -156,12 +161,13 @@ class IndexOptionsAnalyzer:
             logger.error(f"Options processing failed: {str(e)}")
             return []
 
-    def _process_contract(self, contract: Dict, spot: float, 
-                        vix: float, futures: Dict) -> Dict:
-        # Mandatory fields validation
+
+    
+    def _process_contract(self, contract: Dict, spot: float, vix: float, futures: Dict) -> Dict:
         required_fields = ['expiry', 'strikePrice', 'optionType']
-        if not all(field in contract for field in required_fields):
-            raise ValueError("Missing required contract fields")
+        missing = [field for field in required_fields if field not in contract]
+        if missing:
+            raise ValueError(f"Missing fields: {', '.join(missing)}")
             
         # Parse expiry from explicit field
         expiry_str = contract['expiry']
