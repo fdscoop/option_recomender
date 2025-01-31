@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 class OptionsGreeksCalculator:
-    def __init__(self, risk_free_rate: float = 0.07):
+    def __init__(self, risk_free_rate: float = 0.05):  # Adjusted to 5%
         self.risk_free_rate = risk_free_rate
 
     def calculate_greeks(self, spot: float, strike: float, 
@@ -53,41 +53,39 @@ class OptionsGreeksCalculator:
     def _time_to_expiry(self, expiry: str) -> float:
         try:
             expiry_date = datetime.strptime(expiry, '%d%b%Y')
-            return max((expiry_date - datetime.now()).total_seconds()/(365*24*3600), 1/365)
+            now = datetime.now()
+            t = (expiry_date - now).total_seconds() / (365*24*3600)
+            return max(t, 0)  # Corrected to return 0 for past dates
         except:
-            return 1/365
+            return 0.0
 
     def _expiry_greeks(self, spot: float, strike: float, opt_type: str) -> Dict[str, float]:
-        try:
-            intrinsic = max(spot - strike, 0) if opt_type == 'CE' else max(strike - spot, 0)
-            return {
-                'delta': 1.0 if intrinsic > 0 else 0.0,
-                'gamma': 0.0,
-                'theta': -intrinsic,
-                'vega': 0.0,
-                'iv_impact': 0.0
-            }
-        except:
-            return {}
+        intrinsic = max(spot - strike, 0) if opt_type == 'CE' else max(strike - spot, 0)
+        return {
+            'delta': 1.0 if intrinsic > 0 else 0.0,
+            'gamma': 0.0,
+            'theta': 0.0,  # Corrected theta
+            'vega': 0.0,
+            'iv_impact': 0.0
+        }
 
 class IndexOptionsAnalyzer:
     def __init__(self):
         self.greeks_calculator = OptionsGreeksCalculator()
         self.symbol_pattern = re.compile(
-            r'^([A-Z]+)(\d{2,4}[A-Z]{3}\d{0,2})(\d{5})(CE|PE)$', 
+            r'^([A-Z]+)(\d{2}[A-Z]{3}\d{2})(\d{5})(CE|PE)$',  # Adjusted regex for 2-digit year
             re.IGNORECASE
         )
 
     def analyze_options(self, payload: Dict) -> Dict:
         try:
             analysis_data = payload.get('analysis', {})
-            
-            # Validate analysis data structure
             current_market = analysis_data.get('current_market', {})
+            historical_data = analysis_data.get('historical', {})  # Added historical_data extraction
+            
             if not isinstance(current_market, dict):
                 return {'error': 'Invalid current_market data structure'}
                 
-            # Validate required market data
             market_required = ['index', 'options']
             if not all(k in current_market for k in market_required):
                 return {'error': f"Missing market data: {market_required}"}
@@ -265,7 +263,7 @@ class IndexOptionsAnalyzer:
             return {'scalping': 0.34, 'intraday': 0.33, 'swing': 0.33}
 
 class TradingStrategyEngine:
-    def generate_strategies(self, analysis: Dict) -> Dict:
+    def _calculate_strategy_ratings(self, analysis: Dict) -> Dict:
         try:
             return {
                 'scalping': self._base_strategy(analysis, 'scalping', '10-15 minutes'),
@@ -316,21 +314,20 @@ class TradingStrategyEngine:
             'stop_loss': '0.5%' if vix < 18 else '1%',
             'hedging': 'Required' if vix > 20 else 'Recommended'
         }
+    pass
+
+
 @app.route('/analyze', methods=['POST'])
 def analyze():
     try:
         payload = request.get_json()
-        
-        # Validate root payload
         if not payload or not isinstance(payload, dict):
             return jsonify({"error": "Invalid JSON format"}), 400
             
-        # Validate analysis data
         analysis_data = payload.get('analysis')
         if not analysis_data or not isinstance(analysis_data, dict):
             return jsonify({"error": "Missing or invalid analysis data"}), 400
             
-        # Process analysis
         analyzer = IndexOptionsAnalyzer()
         analysis_result = analyzer.analyze_options(payload)
         
