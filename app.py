@@ -123,31 +123,39 @@ class IndexOptionsAnalyzer:
             return {'error': str(e)}
 
     def _process_payload_options(self, payload: Dict, spot: float, 
-                               vix: float, futures: Dict, opt_class: str) -> List[Dict]:
+                           vix: float, futures: Dict, opt_class: str) -> List[Dict]:
         processed = []
-        options_data = payload['analysis']['current_market']['options']
-        
-        # Iterate through expiry buckets
-        for expiry_bucket in options_data['byExpiry'].values():
-            # Get all contracts for this option class (calls/puts)
-            contracts = expiry_bucket[opt_class]
+        try:
+            # Safely navigate through the payload structure
+            options_data = payload.get('analysis', {}).get('current_market', {}).get('options', {})
+            expiry_data = options_data.get('byExpiry', {})
             
-            for strike_data in contracts.values():
-                for contract in strike_data.values():
-                    try:
-                        # Use EXPLICIT fields from exchange data
-                        processed_option = self._process_contract(
-                            contract,
-                            spot,
-                            vix,
-                            futures
-                        )
-                        if processed_option:
-                            processed.append(processed_option)
-                    except Exception as e:
-                        logger.warning(f"Skipping contract {contract.get('symbol')}: {str(e)}")
-        
-        return self._filter_atm_options(processed, spot)
+            # Handle case where no expiry data exists
+            if not expiry_data:
+                logger.warning("No expiry data found in options payload")
+                return []
+
+            for expiry_bucket in expiry_data.values():
+                # Safely get contracts for this option class
+                contracts = expiry_bucket.get(opt_class, {})
+                
+                for strike_data in contracts.values():
+                    for contract in strike_data.values():
+                        try:
+                            processed_option = self._process_contract(contract, spot, vix, futures)
+                            if processed_option:
+                                processed.append(processed_option)
+                        except Exception as e:
+                            logger.warning(f"Skipping contract: {str(e)}")
+            
+            return self._filter_atm_options(processed, spot)
+            
+        except KeyError as ke:
+            logger.error(f"Malformed options data structure: {str(ke)}")
+            return []
+        except Exception as e:
+            logger.error(f"Options processing failed: {str(e)}")
+            return []
 
     def _process_contract(self, contract: Dict, spot: float, 
                         vix: float, futures: Dict) -> Dict:
