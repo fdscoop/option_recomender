@@ -95,17 +95,19 @@ class IndexOptionsAnalyzer:
             logger.info(f"Processing options with current price: {current_price}, VIX: {vix}")
 
             options_chain = {
-                'calls': self._process_options(
-                    options_data.get('calls', []), 
+                'calls': self._process_payload_options(
+                    payload, 
                     current_price,
                     vix,
-                    futures_data
+                    futures_data,
+                    'calls'
                 ),
-                'puts': self._process_options(
-                    options_data.get('puts', []),
+                'puts': self._process_payload_options(
+                    payload,
                     current_price,
                     vix,
-                    futures_data
+                    futures_data,
+                    'puts'
                 )
             }
 
@@ -120,78 +122,89 @@ class IndexOptionsAnalyzer:
             logger.error(f"Analysis error: {str(e)}", exc_info=True)
             return {'error': str(e)}
 
-    def _process_options(self, options: List[Dict], spot: float, 
-                       vix: float, futures: Dict) -> List[Dict]:
+    def _process_payload_options(self, payload: Dict, spot: float, 
+                               vix: float, futures: Dict, opt_class: str) -> List[Dict]:
         processed = []
-        for opt in options:
-            try:
-                # Use explicit fields from payload when available
-                strike = opt.get('strikePrice')
-                expiry_str = opt.get('expiry')
-                opt_type = 'CE' if opt.get('optionType', '') == 'CALL' else 'PE'
-
-                # Fallback to symbol parsing if needed
-                if not all([strike, expiry_str]):
-                    symbol = opt.get('tradingSymbol', '')
-                    match = self.symbol_pattern.match(symbol)
-                    if not match:
-                        logger.warning(f"Skipping option with invalid symbol: {symbol}")
-                        continue
-                    
-                    expiry_str = match.group(2)
-                    strike = float(match.group(3))
-
-                # Parse expiry date
-                try:
-                    expiry_date = self._parse_expiry(expiry_str)
-                    formatted_expiry = expiry_date.strftime('%d%b%Y').upper()
-                except ValueError as e:
-                    logger.warning(f"Invalid expiry format {expiry_str}: {str(e)}")
-                    continue
-
-                greeks = self.greeks_calculator.calculate_greeks(
-                    spot=spot,
-                    strike=strike,
-                    expiry=formatted_expiry,
-                    iv=vix/100 if vix > 0 else 0.2,
-                    opt_type=opt_type
-                )
-
-                processed.append({
-                    'strike': strike,
-                    'premium': opt.get('ltp', 0),
-                    'expiry': formatted_expiry,
-                    'type': opt_type,
-                    'greeks': greeks or {},
-                    'liquidity_score': self._calculate_liquidity(opt, futures),
-                    'depth': self._process_depth(opt.get('depth', {})),
-                    'timeframe_suitability': {
-                        'scalping': greeks.get('gamma', 0) * 2,
-                        'intraday': greeks.get('delta', 0) ** 2,
-                        'swing': greeks.get('vega', 0) * 0.7
-                    }
-                })
-            except Exception as e:
-                logger.warning(f"Skipping option {opt.get('tradingSymbol')}: {str(e)}")
+        options_data = payload['analysis']['current_market']['options']
+        
+        # Iterate through expiry buckets
+        for expiry_bucket in options_data['byExpiry'].values():
+            # Get all contracts for this option class (calls/puts)
+            contracts = expiry_bucket[opt_class]
+            
+            for strike_data in contracts.values():
+                for contract in strike_data.values():
+                    try:
+                        # Use EXPLICIT fields from exchange data
+                        processed_option = self._process_contract(
+                            contract,
+                            spot,
+                            vix,
+                            futures
+                        )
+                        if processed_option:
+                            processed.append(processed_option)
+                    except Exception as e:
+                        logger.warning(f"Skipping contract {contract.get('symbol')}: {str(e)}")
         
         return self._filter_atm_options(processed, spot)
 
-    def _parse_expiry(self, expiry_str: str) -> datetime:
+    def _process_contract(self, contract: Dict, spot: float, 
+                        vix: float, futures: Dict) -> Dict:
+        # Mandatory fields validation
+        required_fields = ['expiry', 'strikePrice', 'optionType']
+        if not all(field in contract for field in required_fields):
+            raise ValueError("Missing required contract fields")
+            
+        # Parse expiry from explicit field
+        expiry_str = contract['expiry']
+        strike = contract['strikePrice']
+        opt_type = 'CE' if contract['optionType'].upper() == 'CALL' else 'PE'
+
+        # Convert expiry to standard format
+        expiry_date = self._parse_exchange_expiry(expiry_str)
+        formatted_expiry = expiry_date.strftime('%d%b%Y').upper()
+
+        # Calculate Greeks
+        greeks = self.greeks_calculator.calculate_greeks(
+            spot=spot,
+            strike=strike,
+            expiry=formatted_expiry,
+            iv=vix/100 if vix > 0 else 0.2,
+            opt_type=opt_type
+        )
+
+        return {
+            'strike': strike,
+            'premium': contract.get('ltp', 0),
+            'expiry': formatted_expiry,
+            'type': opt_type,
+            'greeks': greeks or {},
+            'liquidity_score': self._calculate_liquidity(contract, futures),
+            'depth': self._process_depth(contract.get('depth', {})),
+            'timeframe_suitability': {
+                'scalping': greeks.get('gamma', 0) * 2,
+                'intraday': greeks.get('delta', 0) ** 2,
+                'swing': greeks.get('vega', 0) * 0.7
+            }
+        }
+
+    def _parse_exchange_expiry(self, expiry_str: str) -> datetime:
+        """Parse exchange-provided expiry with multiple format support"""
         formats = [
             '%d%b%Y',  # 06FEB2025
-            '%d%b%y',  # 06FEB25
-            '%d%b',     # 06FEB (assume current year)
+            '%d-%b-%Y', # 06-FEB-2025
+            '%Y%m%d',   # 20250206
+            '%d/%m/%Y'  # 06/02/2025
         ]
         
         for fmt in formats:
             try:
-                dt = datetime.strptime(expiry_str, fmt)
-                if fmt == '%d%b':
-                    dt = dt.replace(year=datetime.now().year)
-                return dt
+                return datetime.strptime(expiry_str, fmt)
             except ValueError:
                 continue
         raise ValueError(f"Unsupported expiry format: {expiry_str}")
+    
 
     def _filter_atm_options(self, options: List[Dict], spot: float) -> List[Dict]:
         filtered = [p for p in options if 0.95 < (p['strike'] / spot) < 1.05]
