@@ -126,27 +126,20 @@ class IndexOptionsAnalyzer:
                             vix: float, futures: Dict, opt_class: str) -> List[Dict]:
         processed = []
         try:
-            options_structure = payload.get('analysis', {}).get('options_structure', {})
-            options_data = options_structure.get('options', {})
-            expiry_data = options_data.get('byExpiry', {})
-
-            for expiry_bucket in expiry_data.values():
-                # Get calls/puts for this expiry
-                contracts = expiry_bucket.get(opt_class, {})
-                
-                # Iterate through strikes
-                for strike_key, contract in contracts.items():
-                    # Handle case where strike contains multiple contracts
-                    if isinstance(contract, dict) and 'strikePrice' in contract:
-                        # Single contract per strike
-                        try:
-                            processed.append(self._process_contract(contract, spot, vix, futures))
-                        except Exception as e:
-                            logger.warning(f"Skipping contract {strike_key}: {str(e)}")
-                    else:
-                        # Handle nested contracts (unlikely in your case)
-                        logger.warning(f"Unexpected contract structure at strike {strike_key}")
-
+            # Get options from CURRENT MARKET DATA, not options structure
+            current_market = payload.get('analysis', {}).get('current_market', {})
+            options_data = current_market.get('options', {})
+            
+            # Process calls/puts directly
+            contracts = options_data.get(opt_class, [])
+            
+            for contract in contracts:
+                try:
+                    processed_contract = self._process_contract(contract, spot, vix, futures)
+                    processed.append(processed_contract)
+                except Exception as e:
+                    logger.warning(f"Skipping contract: {str(e)}")
+            
             return self._filter_atm_options(processed, spot)
         
         except Exception as e:
@@ -156,40 +149,31 @@ class IndexOptionsAnalyzer:
     
 
     def _process_contract(self, contract: Dict, spot: float, 
-                    vix: float, futures: Dict) -> Dict:
-        # Validate contract structure
-        required_fields = ['expiry', 'strikePrice', 'optionType', 'ltp']
+                        vix: float, futures: Dict) -> Dict:
+        # Validate required fields
+        required_fields = ['ltp', 'strikePrice', 'expiry', 'optionType']
         missing = [f for f in required_fields if f not in contract]
         if missing:
             raise ValueError(f"Missing fields: {', '.join(missing)}")
+
+        # Parse expiry
+        expiry_date = self._parse_exchange_expiry(contract['expiry'])
         
-        if not isinstance(contract.get('ltp'), (int, float)):
-            raise ValueError("Invalid price data type")
-            
-        # Parse expiry from explicit field
-        expiry_str = contract['expiry']
-        strike = contract['strikePrice']
-        opt_type = 'CE' if contract['optionType'].upper() == 'CALL' else 'PE'
-
-        # Convert expiry to standard format
-        expiry_date = self._parse_exchange_expiry(expiry_str)
-        formatted_expiry = expiry_date.strftime('%d%b%Y').upper()
-
         # Calculate Greeks
         greeks = self.greeks_calculator.calculate_greeks(
             spot=spot,
-            strike=strike,
-            expiry=formatted_expiry,
-            iv=vix/100 if vix > 0 else 0.2,
-            opt_type=opt_type
+            strike=contract['strikePrice'],
+            expiry=expiry_date.strftime('%d%b%Y').upper(),
+            iv=vix/100,
+            opt_type='CE' if contract['optionType'].upper() == 'CALL' else 'PE'
         )
-
+        
         return {
             'strike': contract['strikePrice'],
-            'premium': contract.get('ltp', 0),
-            'expiry': self._parse_exchange_expiry(contract['expiry']).strftime('%d%b%Y').upper(),
+            'premium': contract['ltp'],
+            'expiry': expiry_date.strftime('%d%b%Y').upper(),
             'type': 'CE' if contract['optionType'].upper() == 'CALL' else 'PE',
-            'greeks': greeks or {},
+            'greeks': greeks,
             'liquidity_score': self._calculate_liquidity(contract, futures),
             'depth': self._process_depth(contract.get('depth', {})),
             'timeframe_suitability': {
