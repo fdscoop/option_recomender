@@ -7,7 +7,6 @@ import logging
 import re
 from typing import Dict, List, Any
 
-# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -74,13 +73,15 @@ class OptionsGreeksCalculator:
 class IndexOptionsAnalyzer:
     def __init__(self):
         self.greeks_calculator = OptionsGreeksCalculator()
-        self.symbol_pattern = re.compile(r'NIFTY(\d{2}[A-Z]{3}\d{2,4})(\d{5})(CE|PE)$')
+        self.symbol_pattern = re.compile(
+            r'^(NIFTY|BANKNIFTY|FINNIFTY|MIDCPNIFTY)(\d{2}[A-Z]{3}\d{2})(\d{5})(CE|PE)$', 
+            re.IGNORECASE
+        )
 
     def analyze_options(self, payload: Dict) -> Dict:
         try:
             analysis_data = payload.get('analysis', {})
             
-            # Validate payload structure
             required_keys = ['current_market', 'historical_data']
             if not all(k in analysis_data for k in required_keys):
                 return {'error': f"Missing required keys: {required_keys}"}
@@ -88,12 +89,10 @@ class IndexOptionsAnalyzer:
             current_market = analysis_data['current_market']
             historical_data = analysis_data.get('historical_data', {})
             
-            # Validate market data structure
             market_required = ['index', 'options']
             if not all(k in current_market for k in market_required):
                 return {'error': f"Missing market data: {market_required}"}
 
-            # Extract market data with safe defaults
             index_data = current_market.get('index', {})
             current_price = index_data.get('ltp', 0)
             vix = current_market.get('vix', {}).get('ltp', 0)
@@ -102,7 +101,6 @@ class IndexOptionsAnalyzer:
 
             logger.info(f"Processing options with current price: {current_price}, VIX: {vix}")
 
-            # Process options chain
             options_chain = {
                 'calls': self._process_options(
                     options_data.get('calls', []), 
@@ -122,7 +120,7 @@ class IndexOptionsAnalyzer:
                 'current_price': current_price,
                 'vix': vix,
                 'options_chain': options_chain,
-                'market_conditions': self._analyze_market_conditions(historical_data),
+                'market_conditions': self._analyze_market_conditions(historical_data, vix),
                 'strategy_ratings': self._calculate_strategy_ratings(options_chain, vix)
             }
         except Exception as e:
@@ -134,18 +132,16 @@ class IndexOptionsAnalyzer:
         processed = []
         for opt in options:
             try:
-                # Parse strike and expiry from trading symbol
                 symbol = opt.get('tradingSymbol', '')
                 match = self.symbol_pattern.match(symbol)
                 if not match:
                     logger.warning(f"Skipping option with invalid symbol: {symbol}")
                     continue
                 
-                expiry_str = match.group(1)
-                strike = float(match.group(2))
-                opt_type = match.group(3).upper()
+                expiry_str = match.group(2)
+                strike = float(match.group(3))
+                opt_type = match.group(4).upper()
 
-                # Convert expiry to standard format
                 try:
                     expiry_date = datetime.strptime(expiry_str, '%d%b%y')
                 except ValueError:
@@ -167,10 +163,7 @@ class IndexOptionsAnalyzer:
                     'expiry': formatted_expiry,
                     'type': opt_type,
                     'greeks': greeks or {},
-                    'liquidity_score': self._calculate_liquidity(
-                        opt.get('opnInterest', 0),  # Match payload spelling
-                        futures.get('opnInterest', 0)
-                    ),
+                    'liquidity_score': self._calculate_liquidity(opt, futures),
                     'depth': self._process_depth(opt.get('depth', {})),
                     'timeframe_suitability': {
                         'scalping': greeks.get('gamma', 0) * 2,
@@ -181,40 +174,45 @@ class IndexOptionsAnalyzer:
             except Exception as e:
                 logger.warning(f"Skipping option {symbol}: {str(e)}")
         
-        # Return top 3 nearest strikes
-        return sorted(
-            [p for p in processed if p['greeks']], 
-            key=lambda x: abs(x['strike'] - spot)
-        )[:3]
+        # Filter for ATM options (±5%) and select top 3 nearest
+        filtered = [p for p in processed if 0.95 < (p['strike'] / spot) < 1.05]
+        return sorted(filtered, key=lambda x: abs(x['strike'] - spot))[:3]
 
-    def _calculate_liquidity(self, option_oi: int, futures_oi: int) -> float:
+    def _calculate_liquidity(self, option: Dict, futures: Dict) -> float:
         try:
-            if futures_oi <= 0 or option_oi <= 0:
-                return 0.5
-            return min(option_oi / (futures_oi / 1000), 1.0)
+            option_oi = option.get('opnInterest', 0)
+            futures_oi = futures.get('opnInterest', 1)
+            option_vol = option.get('tradeVolume', 0)
+            futures_vol = futures.get('tradeVolume', 1)
+            
+            oi_ratio = option_oi / futures_oi if futures_oi > 0 else 0
+            vol_ratio = option_vol / futures_vol if futures_vol > 0 else 0
+            
+            return min(0.4 * oi_ratio + 0.6 * vol_ratio, 1.0)
         except:
             return 0.5
 
     def _process_depth(self, depth: Dict) -> Dict:
         try:
-            buy = depth.get('buy', [{}])
-            sell = depth.get('sell', [{}])
+            bids = sorted([b.get('price',0) for b in depth.get('buy',[])[:5]], reverse=True)
+            asks = sorted([a.get('price',0) for a in depth.get('sell',[])[:5]])
+            
+            avg_bid = sum(bids[:3])/3 if bids else 0
+            avg_ask = sum(asks[:3])/3 if asks else 0
+            
             return {
-                'best_bid': buy[0].get('price', 0) if buy else 0,
-                'best_ask': sell[0].get('price', 0) if sell else 0,
-                'spread': abs(
-                    (sell[0].get('price', 0) if sell else 0) - 
-                    (buy[0].get('price', 0) if buy else 0)
-                )
+                'best_bid': bids[0] if bids else 0,
+                'best_ask': asks[0] if asks else 0,
+                'avg_spread': avg_ask - avg_bid
             }
         except:
-            return {'best_bid': 0, 'best_ask': 0, 'spread': 0}
+            return {'best_bid': 0, 'best_ask': 0, 'avg_spread': 0}
 
-    def _analyze_market_conditions(self, historical_data: Dict) -> Dict:
+    def _analyze_market_conditions(self, historical_data: Dict, vix: float) -> Dict:
         try:
             index_history = historical_data.get('index', [])
             if not index_history:
-                return {'trend': 'neutral', 'volatility': 'low'}
+                return {'trend': 'neutral', 'volatility': 'low', 'vix': vix}
 
             closes = []
             for entry in index_history:
@@ -222,20 +220,25 @@ class IndexOptionsAnalyzer:
                     closes.append(entry['price_data']['close'])
                 
             if len(closes) < 20:
-                return {'trend': 'neutral', 'volatility': 'low'}
+                return {'trend': 'neutral', 'volatility': 'low', 'vix': vix}
 
             ma5 = np.mean(closes[-5:])
             ma20 = np.mean(closes[-20:])
             daily_returns = np.diff(closes) / closes[:-1]
             
+            volatility = 'high' if np.std(daily_returns) > 0.015 else 'low'
+            if vix > 15:  # Override volatility based on VIX
+                volatility = 'high'
+            
             return {
                 'trend': 'bullish' if ma5 > ma20 else 'bearish',
-                'volatility': 'high' if np.std(daily_returns) > 0.02 else 'low',
-                'last_close': closes[-1]
+                'volatility': volatility,
+                'vix': vix,
+                'last_close': closes[-1] if closes else 0
             }
         except Exception as e:
             logger.error(f"Market analysis error: {str(e)}")
-            return {'trend': 'neutral', 'volatility': 'low'}
+            return {'trend': 'neutral', 'volatility': 'low', 'vix': vix}
 
     def _calculate_strategy_ratings(self, options_chain: Dict, vix: float) -> Dict:
         try:
@@ -246,8 +249,8 @@ class IndexOptionsAnalyzer:
                     scores['intraday'] += opt.get('greeks', {}).get('delta', 0) ** 2
                     scores['swing'] += opt.get('greeks', {}).get('vega', 0) * 0.7
 
-            total = sum(scores.values()) or 1.0  # Prevent division by zero
-            vix_factor = max(min(vix / 20, 2.0), 0.5)  # Clamped between 0.5-2.0
+            total = sum(scores.values()) or 1.0
+            vix_factor = max(min(vix / 20, 2.0), 0.5)
             
             return {
                 'scalping': round(scores['scalping']/total * (1 - vix_factor), 2),
@@ -316,19 +319,17 @@ def analyze():
     try:
         payload = request.get_json()
         
-        # Validate payload structure
         if not payload or not isinstance(payload, dict):
             return jsonify({"error": "Invalid JSON format"}), 400
             
         if 'analysis' not in payload:
-            return jsonify({"error": "Missing 'analysis' key in payload"}), 400
+            return jsonify({"error": "Missing 'analysis' key"}), 400
             
         analysis_data = payload['analysis']
         required_keys = ['current_market', 'historical_data']
         if not all(k in analysis_data for k in required_keys):
-            return jsonify({"error": f"Missing required analysis keys: {required_keys}"}), 400
+            return jsonify({"error": f"Missing analysis keys: {required_keys}"}), 400
 
-        # Process analysis
         analyzer = IndexOptionsAnalyzer()
         analysis_result = analyzer.analyze_options(payload)
         
