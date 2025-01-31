@@ -74,7 +74,7 @@ class IndexOptionsAnalyzer:
     def __init__(self):
         self.greeks_calculator = OptionsGreeksCalculator()
         self.symbol_pattern = re.compile(
-            r'^(NIFTY|BANKNIFTY|FINNIFTY|MIDCPNIFTY)(\d{2}[A-Z]{3}\d{2})(\d{5})(CE|PE)$', 
+            r'^([A-Z]+)(\d{2,4}[A-Z]{3}\d{0,2})(\d{5})(CE|PE)$', 
             re.IGNORECASE
         )
 
@@ -82,13 +82,12 @@ class IndexOptionsAnalyzer:
         try:
             analysis_data = payload.get('analysis', {})
             
-            required_keys = ['current_market', 'historical_data']
-            if not all(k in analysis_data for k in required_keys):
-                return {'error': f"Missing required keys: {required_keys}"}
-
-            current_market = analysis_data['current_market']
-            historical_data = analysis_data.get('historical_data', {})
-            
+            # Validate analysis data structure
+            current_market = analysis_data.get('current_market', {})
+            if not isinstance(current_market, dict):
+                return {'error': 'Invalid current_market data structure'}
+                
+            # Validate required market data
             market_required = ['index', 'options']
             if not all(k in current_market for k in market_required):
                 return {'error': f"Missing market data: {market_required}"}
@@ -123,9 +122,13 @@ class IndexOptionsAnalyzer:
                 'market_conditions': self._analyze_market_conditions(historical_data, vix),
                 'strategy_ratings': self._calculate_strategy_ratings(options_chain, vix)
             }
+        except TypeError as te:
+            logger.error(f"Type error in analysis: {str(te)}")
+            return {'error': f"Data type mismatch: {str(te)}"}
         except Exception as e:
-            logger.error(f"Analysis error: {str(e)}", exc_info=True)
-            return {'error': str(e)}
+            logger.error(f"Unhandled analysis error: {str(e)}", exc_info=True)
+            return {'error': 'Internal analysis error'}
+
 
     def _process_options(self, options: List[Dict], spot: float, 
                        vix: float, futures: Dict) -> List[Dict]:
@@ -313,23 +316,21 @@ class TradingStrategyEngine:
             'stop_loss': '0.5%' if vix < 18 else '1%',
             'hedging': 'Required' if vix > 20 else 'Recommended'
         }
-
 @app.route('/analyze', methods=['POST'])
 def analyze():
     try:
         payload = request.get_json()
         
+        # Validate root payload
         if not payload or not isinstance(payload, dict):
             return jsonify({"error": "Invalid JSON format"}), 400
             
-        if 'analysis' not in payload:
-            return jsonify({"error": "Missing 'analysis' key"}), 400
+        # Validate analysis data
+        analysis_data = payload.get('analysis')
+        if not analysis_data or not isinstance(analysis_data, dict):
+            return jsonify({"error": "Missing or invalid analysis data"}), 400
             
-        analysis_data = payload['analysis']
-        required_keys = ['current_market', 'historical_data']
-        if not all(k in analysis_data for k in required_keys):
-            return jsonify({"error": f"Missing analysis keys: {required_keys}"}), 400
-
+        # Process analysis
         analyzer = IndexOptionsAnalyzer()
         analysis_result = analyzer.analyze_options(payload)
         
