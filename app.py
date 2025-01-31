@@ -1,6 +1,6 @@
+
 from flask import Flask, request, jsonify
 import numpy as np
-import pandas as pd
 from scipy.stats import norm
 from datetime import datetime
 import logging
@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 class OptionsGreeksCalculator:
-    def __init__(self, risk_free_rate: float = 0.05):  # Adjusted to 5%
+    def __init__(self, risk_free_rate: float = 0.07):
         self.risk_free_rate = risk_free_rate
 
     def calculate_greeks(self, spot: float, strike: float, 
@@ -55,7 +55,7 @@ class OptionsGreeksCalculator:
             expiry_date = datetime.strptime(expiry, '%d%b%Y')
             now = datetime.now()
             t = (expiry_date - now).total_seconds() / (365*24*3600)
-            return max(t, 0)  # Corrected to return 0 for past dates
+            return max(t, 0)  # Ensure non-negative time
         except:
             return 0.0
 
@@ -64,7 +64,7 @@ class OptionsGreeksCalculator:
         return {
             'delta': 1.0 if intrinsic > 0 else 0.0,
             'gamma': 0.0,
-            'theta': 0.0,  # Corrected theta
+            'theta': 0.0,  # Corrected theta to 0 for expired options
             'vega': 0.0,
             'iv_impact': 0.0
         }
@@ -73,19 +73,21 @@ class IndexOptionsAnalyzer:
     def __init__(self):
         self.greeks_calculator = OptionsGreeksCalculator()
         self.symbol_pattern = re.compile(
-            r'^([A-Z]+)(\d{2}[A-Z]{3}\d{2})(\d{5})(CE|PE)$',  # Adjusted regex for 2-digit year
+            r'^(NIFTY|BANKNIFTY|FINNIFTY|MIDCPNIFTY)(\d{2}[A-Z]{3}\d{2})(\d{5})(CE|PE)$', 
             re.IGNORECASE
         )
 
     def analyze_options(self, payload: Dict) -> Dict:
         try:
             analysis_data = payload.get('analysis', {})
-            current_market = analysis_data.get('current_market', {})
-            historical_data = analysis_data.get('historical', {})  # Added historical_data extraction
             
-            if not isinstance(current_market, dict):
-                return {'error': 'Invalid current_market data structure'}
-                
+            required_keys = ['current_market', 'historical_data']
+            if not all(k in analysis_data for k in required_keys):
+                return {'error': f"Missing required keys: {required_keys}"}
+
+            current_market = analysis_data['current_market']
+            historical_data = analysis_data['historical_data']  # Correct extraction
+            
             market_required = ['index', 'options']
             if not all(k in current_market for k in market_required):
                 return {'error': f"Missing market data: {market_required}"}
@@ -120,13 +122,9 @@ class IndexOptionsAnalyzer:
                 'market_conditions': self._analyze_market_conditions(historical_data, vix),
                 'strategy_ratings': self._calculate_strategy_ratings(options_chain, vix)
             }
-        except TypeError as te:
-            logger.error(f"Type error in analysis: {str(te)}")
-            return {'error': f"Data type mismatch: {str(te)}"}
         except Exception as e:
-            logger.error(f"Unhandled analysis error: {str(e)}", exc_info=True)
-            return {'error': 'Internal analysis error'}
-
+            logger.error(f"Analysis error: {str(e)}", exc_info=True)
+            return {'error': str(e)}
 
     def _process_options(self, options: List[Dict], spot: float, 
                        vix: float, futures: Dict) -> List[Dict]:
@@ -208,17 +206,14 @@ class IndexOptionsAnalyzer:
             }
         except:
             return {'best_bid': 0, 'best_ask': 0, 'avg_spread': 0}
-
+    
     def _analyze_market_conditions(self, historical_data: Dict, vix: float) -> Dict:
         try:
             index_history = historical_data.get('index', [])
             if not index_history:
                 return {'trend': 'neutral', 'volatility': 'low', 'vix': vix}
 
-            closes = []
-            for entry in index_history:
-                if 'price_data' in entry and 'close' in entry['price_data']:
-                    closes.append(entry['price_data']['close'])
+            closes = [entry['price_data']['close'] for entry in index_history if 'price_data' in entry and 'close' in entry['price_data']]
                 
             if len(closes) < 20:
                 return {'trend': 'neutral', 'volatility': 'low', 'vix': vix}
@@ -254,16 +249,16 @@ class IndexOptionsAnalyzer:
             vix_factor = max(min(vix / 20, 2.0), 0.5)
             
             return {
-                'scalping': round(scores['scalping']/total * (1 - vix_factor), 2),
-                'intraday': round(scores['intraday']/total * vix_factor, 2),
-                'swing': round(scores['swing']/total * (1 + vix_factor), 2)
+                'scalping': max(round(scores['scalping']/total * (2.0 - vix_factor), 2), 0),
+                'intraday': max(round(scores['intraday']/total * vix_factor, 2), 0),
+                'swing': max(round(scores['swing']/total * (1 + vix_factor), 2), 0)
             }
         except Exception as e:
             logger.error(f"Strategy ratings error: {str(e)}")
             return {'scalping': 0.34, 'intraday': 0.33, 'swing': 0.33}
 
 class TradingStrategyEngine:
-    def _calculate_strategy_ratings(self, analysis: Dict) -> Dict:
+    def generate_strategies(self, analysis: Dict) -> Dict:
         try:
             return {
                 'scalping': self._base_strategy(analysis, 'scalping', '10-15 minutes'),
@@ -314,20 +309,23 @@ class TradingStrategyEngine:
             'stop_loss': '0.5%' if vix < 18 else '1%',
             'hedging': 'Required' if vix > 20 else 'Recommended'
         }
-    pass
-
 
 @app.route('/analyze', methods=['POST'])
 def analyze():
     try:
         payload = request.get_json()
+        
         if not payload or not isinstance(payload, dict):
             return jsonify({"error": "Invalid JSON format"}), 400
             
-        analysis_data = payload.get('analysis')
-        if not analysis_data or not isinstance(analysis_data, dict):
-            return jsonify({"error": "Missing or invalid analysis data"}), 400
+        if 'analysis' not in payload:
+            return jsonify({"error": "Missing 'analysis' key"}), 400
             
+        analysis_data = payload['analysis']
+        required_keys = ['current_market', 'historical_data']
+        if not all(k in analysis_data for k in required_keys):
+            return jsonify({"error": f"Missing analysis keys: {required_keys}"}), 400
+
         analyzer = IndexOptionsAnalyzer()
         analysis_result = analyzer.analyze_options(payload)
         
@@ -347,3 +345,5 @@ def home():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
+
+    
