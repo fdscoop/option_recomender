@@ -131,43 +131,40 @@ class IndexOptionsAnalyzer:
             expiry_data = options_data.get('byExpiry', {})
 
             for expiry_bucket in expiry_data.values():
+                # Get calls/puts for this expiry
                 contracts = expiry_bucket.get(opt_class, {})
                 
-                # Add type checking for strike data
-                for strike_key, strike_data in contracts.items():
-                    if not isinstance(strike_data, dict):
-                        logger.warning(f"Invalid strike data type for {strike_key}")
-                        continue
-                    
-                    # Add type checking for contract data
-                    for contract_key, contract in strike_data.items():
-                        if not isinstance(contract, dict):
-                            logger.warning(f"Invalid contract type for {contract_key}")
-                            continue
-                            
+                # Iterate through strikes
+                for strike_key, contract in contracts.items():
+                    # Handle case where strike contains multiple contracts
+                    if isinstance(contract, dict) and 'strikePrice' in contract:
+                        # Single contract per strike
                         try:
-                            processed_option = self._process_contract(contract, spot, vix, futures)
-                            if processed_option:
-                                processed.append(processed_option)
+                            processed.append(self._process_contract(contract, spot, vix, futures))
                         except Exception as e:
-                            logger.warning(f"Skipping contract {contract_key}: {str(e)}")
-            
+                            logger.warning(f"Skipping contract {strike_key}: {str(e)}")
+                    else:
+                        # Handle nested contracts (unlikely in your case)
+                        logger.warning(f"Unexpected contract structure at strike {strike_key}")
+
             return self._filter_atm_options(processed, spot)
-                
-        except KeyError as ke:
-            logger.error(f"Malformed options data structure: {str(ke)}")
-            return []
+        
         except Exception as e:
             logger.error(f"Options processing failed: {str(e)}")
             return []
 
-
     
-    def _process_contract(self, contract: Dict, spot: float, vix: float, futures: Dict) -> Dict:
-        required_fields = ['expiry', 'strikePrice', 'optionType']
-        missing = [field for field in required_fields if field not in contract]
+
+    def _process_contract(self, contract: Dict, spot: float, 
+                    vix: float, futures: Dict) -> Dict:
+        # Validate contract structure
+        required_fields = ['expiry', 'strikePrice', 'optionType', 'ltp']
+        missing = [f for f in required_fields if f not in contract]
         if missing:
             raise ValueError(f"Missing fields: {', '.join(missing)}")
+        
+        if not isinstance(contract.get('ltp'), (int, float)):
+            raise ValueError("Invalid price data type")
             
         # Parse expiry from explicit field
         expiry_str = contract['expiry']
@@ -188,10 +185,10 @@ class IndexOptionsAnalyzer:
         )
 
         return {
-            'strike': strike,
+            'strike': contract['strikePrice'],
             'premium': contract.get('ltp', 0),
-            'expiry': formatted_expiry,
-            'type': opt_type,
+            'expiry': self._parse_exchange_expiry(contract['expiry']).strftime('%d%b%Y').upper(),
+            'type': 'CE' if contract['optionType'].upper() == 'CALL' else 'PE',
             'greeks': greeks or {},
             'liquidity_score': self._calculate_liquidity(contract, futures),
             'depth': self._process_depth(contract.get('depth', {})),
