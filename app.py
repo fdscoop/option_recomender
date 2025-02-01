@@ -152,7 +152,7 @@ class IndexOptionsAnalyzer:
                 'options_chain': options_chain,
                 'market_conditions': self._analyze_market_conditions(historical_data, vix),
                 'strategy_ratings': self._calculate_strategy_ratings(options_chain, vix),
-                # "historical_index_prices" is needed internally for forecasting but will be removed from the final output.
+                # Keep historical data internally for forecasting—but it will be removed from the final output.
                 'historical_index_prices': historical_index_prices
             }
             return result
@@ -367,9 +367,11 @@ class ForecastingEngine:
 class TradingStrategyEngine:
     def generate_strategies(self, analysis: Dict) -> Dict:
         try:
-            # Remove historical data from analysis to reduce output size,
-            # but first retrieve it for forecasting.
+            # Remove and downsample historical data to reduce memory footprint.
             historical_prices = analysis.pop("historical_index_prices", [])
+            if len(historical_prices) > 1000:
+                n = len(historical_prices) // 1000
+                historical_prices = historical_prices[::n]
             forecast_info = {}
             if historical_prices and len(historical_prices) >= 10:
                 forecasting_engine = ForecastingEngine()
@@ -448,9 +450,10 @@ def handle_webhook():
             }), 400
         strategy_engine = TradingStrategyEngine()
         strategies = strategy_engine.generate_strategies(analysis_result)
+        # Do not include historical_index_prices in the output.
         return jsonify({
             "success": True,
-            "analysis": analysis_result,  # historical_index_prices is no longer included
+            "analysis": analysis_result,
             "strategies": strategies
         })
     except Exception as e:
