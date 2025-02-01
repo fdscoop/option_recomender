@@ -6,4 +6,4 @@ requests
 gunicorn
 Flask-Cors
 statsmodels
-tensorflow
+tensorflow==2.10.0
