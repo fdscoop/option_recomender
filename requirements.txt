@@ -5,3 +5,4 @@ scipy
 requests
 gunicorn
 Flask-Cors
+statsmodels
